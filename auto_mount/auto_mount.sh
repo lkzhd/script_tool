@@ -12,12 +12,18 @@ E_EARGC=4 #argc num is invalid
 E_EARGS=5 #args error
 E_MOUNTPOINT=6 #mount point invalid,maybe there are multiple likely dir
 E_USER_UNDO=7 #
+E_EMKFS=8
 
 CURREENT_DIR=`pwd`
 CONF_FILE='disk_list'
 CONF_FILE_PATH=''
 
 GLOBAL_RETURN=0
+#
+#In some case ,we may need use uuid path.
+USE_DEVUUID=1
+DEVUUID_PATH_PREFIX='/dev/disk/by-id/wwn-0x'
+
 
 function errstr_echo()
 {
@@ -50,9 +56,52 @@ function errstr_echo()
                 echo "user cancel operation"
                 ;;
 
+                $E_EMKFS)
+                echo "mkfs failed"
+                ;;
+
                 *)
                 echo "unknown error"
         esac
+}
+
+function check_is_mounted()
+{
+        local return_value=0
+        mount | awk '{print $3}' | while read line;do
+                if [ $line == "$1" ];then
+                        echo "$1 is a mount point,remount it"
+                        return 1
+                else
+                        #echo "$1 is not a mount point"
+                        :
+                fi
+        done
+        return $return_value
+}
+
+function mkfs_on_dev()
+{
+        echo $*
+        local return_value=0
+
+        if [ $USE_DEVUUID -eq 1 ];then
+                local dev_uuid=`scsi_id --page=0x80 --whitelisted \
+                --device="$1" | awk '{print $4}'`
+                echo "$DEVUUID_PATH_PREFIX$dev_uuid"
+                #mkfs -t $2 "$DEVUUID_PATH_PREFIX$dev_uuid"
+                mkfs.xfs -f "$DEVUUID_PATH_PREFIX$dev_uuid" &>/dev/null
+        else
+                #mkfs -t $2 $1
+                mkfs.xfs -f "$1" &>/dev/null
+        fi
+        if [ $? -eq 0 ];then
+                :
+        else
+                return_value=$E_EMKFS
+        fi
+
+        return $return_value
 }
 
 function local_mount()
@@ -65,7 +114,7 @@ function local_mount()
                 return_value=$E_EARGC
         else
                 if [ -d $2 ];then
-                        umount $2 &>/dev/null 
+                        #umount $2 &>/dev/null 
                         mount $1 $2 &>/dev/null
                         return_value=$?
 :<<eof
@@ -96,22 +145,22 @@ function read_conf_and_mount()
         else
                 while read line;do
                         #echo $line
-                        mkfs.xfs -f $line &>/dev/null 
-                        expect_num=1
-                        num=`find /mnt/ -name "*${line##*/}*" -type d -maxdepth 1|wc -l`
+                        local expect_num=1
+                        local num=`find /mnt/ -name "*${line##*/}*" -type d -maxdepth 1|wc -l`
                         if [ $num -eq $expect_num ];then
                                 mount_point=`find /mnt/ -name "*${line##*/}*" -type d -maxdepth 1`
+
+                                check_is_mounted $mount_point && umount $mount_point
+                                mkfs_on_dev $line $fs_type
+                                local_return=$?
+                                if [ $local_return -eq 0 ];then
+                                        :
+                                else
+                                        break
+                                fi
+
                                 local_mount $line $mount_point
                                 local_return=$?
-
-:<<eof
-                                if [ $local_return -eq 0 ];then
-                                        echo "mount $line on $mount_point success"
-                                else
-                                        echo "mount $line on $mount_point failed"
-                                fi
-eof
-
                         elif [ $num -eq 0 ];then
                                 echo "mount point is not exist, so create"
                                 mkdir -p "/mnt/disk_${line##*/}" &>/dev/null
@@ -126,15 +175,6 @@ eof
                                 mount_point=`find /mnt/ -name "*${line##*/}*" -type d -maxdepth 1`
                                 local_mount $line $mount_point
                                 local_return=$?
-                                
-:<<eof
-                                if [ $local_return -eq 0 ];then
-                                        echo "mount $line on $mount_point success"
-                                else
-                                        echo "mount $line on $mount_point failed"
-                                fi
-eof
-
                         else
 :<<eof
                                 echo "mount point ambiguity, have $num likely dir:"
@@ -145,6 +185,15 @@ eof
 eof
                                 local_return=$E_MOUNTPOINT
                         fi
+                        
+                        if [ $local_return -eq 0 ];then
+                                :
+                                #echo "mount $line on $mount_point success"
+                        else
+                                break
+                                #echo "mount $line on $mount_point failed"
+                        fi
+
                 done < "$conf_path"
         fi
         return $local_return
@@ -160,7 +209,7 @@ function input_handler()
                 echo -e "\t$line"
         done < "$1"
 
-        echo -e "\033[31minput [yes/no]: \033[0m"
+        echo -ne "\033[31minput [yes/no]: \033[0m"
 
         read user_input
         case $user_input in
